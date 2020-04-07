@@ -59,7 +59,7 @@ do(State) ->
     deltree(TarDir),
     deltree(WorkDir),
     {Sz, ImageSHA} = sha256_from_file(Name),
-    rebar_api:console("OCI image '~s' created (sha256: ~s, bytes: ~p)~n", [Name, rebar_utils:to_list(ImageSHA), Sz]),
+    rebar_api:info("OCI image '~s' created (sha256: ~s, bytes: ~p)~n", [Name, rebar_utils:to_list(ImageSHA), Sz]),
     {ok, State}.
 
 -spec format_error(any()) ->  iolist().
