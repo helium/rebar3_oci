@@ -34,7 +34,7 @@ do(State) ->
     TarDir = insecure_mkdtemp(),
     OutName = filename:join(TarDir, random_name()),
     RelFiles = filelib:fold_files(RelDir, ".+", true, fun(F, A) -> add_file(RelDir, F, A) end, []),
-    ok = erl_tar:create(OutName, RelFiles, [dereference]),
+    ok = erl_tar:create(OutName, lists:sort(RelFiles), [dereference, {mtime, 0}, {atime, 0}, {ctime, 0}, {uid, 0}, {gid, 0}]),
     {LayerSize, LayerSHA} = sha256_from_file(OutName),
     ConfigJson = jsone:encode(format_oci_config(LayerSHA)),
     ConfigSHA = sha256(ConfigJson),
@@ -55,7 +55,7 @@ do(State) ->
     ImgFiles = filelib:fold_files(WorkDir, ".+", true, fun(F, A) -> add_file(WorkDir, F, A) end, []),
 
     Name = rebar_utils:to_list(get_main_app_name(State)) ++ ".tgz",
-    ok = erl_tar:create(Name, ImgFiles, [compressed]),
+    ok = erl_tar:create(Name, lists:sort(ImgFiles), [compressed, {mtime, 0}, {atime, 0}, {ctime, 0}, {uid, 0}, {gid, 0}]),
     deltree(TarDir),
     deltree(WorkDir),
     {Sz, ImageSHA} = sha256_from_file(Name),
