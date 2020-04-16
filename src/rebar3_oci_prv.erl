@@ -36,14 +36,14 @@ do(State) ->
     RelFiles = filelib:fold_files(RelDir, ".+", true, fun(F, A) -> add_file(RelDir, F, A) end, []),
     ok = erl_tar:create(OutName, lists:sort(RelFiles), [dereference, {mtime, 0}, {atime, 0}, {ctime, 0}, {uid, 0}, {gid, 0}]),
     {LayerSize, LayerSHA} = sha256_from_file(OutName),
-    ConfigJson = jsone:encode(format_oci_config(LayerSHA)),
+    ConfigJson = to_json(format_oci_config(LayerSHA)),
     ConfigSHA = sha256(ConfigJson),
     ConfigSize = byte_size(ConfigJson),
-    ManifestJson = jsone:encode(format_oci_manifest(ConfigSize, ConfigSHA, LayerSize, LayerSHA)),
+    ManifestJson = to_json(format_oci_manifest(ConfigSize, ConfigSHA, LayerSize, LayerSHA)),
     ManifestSHA = sha256(ManifestJson),
     ManifestSize = byte_size(ManifestJson),
-    IndexJson = jsone:encode(format_oci_index(ManifestSize, ManifestSHA)),
-    LayoutJson = jsone:encode(format_oci_layout()),
+    IndexJson = to_json(format_oci_index(ManifestSize, ManifestSHA)),
+    LayoutJson = to_json(format_oci_layout()),
 
     WorkDir = insecure_mkdtemp(),
     ok = mkdir_p(filename:join(WorkDir, "blobs/sha256")),
@@ -65,6 +65,19 @@ do(State) ->
 -spec format_error(any()) ->  iolist().
 format_error(Reason) ->
     io_lib:format("~p", [Reason]).
+
+%% Making map keys print in a deterministic order helps prevent
+%% non-deterministic hashes in the tarballs.
+to_json(M) when is_map(M) ->
+    jsone:encode(lists:sort(make_list(M, []))).
+
+make_list(M, Acc) when is_map(M) ->
+        make_list(maps:to_list(M), Acc);
+make_list([], Acc) -> Acc;
+make_list([ {K, V} | T ], Acc) when is_map(V) ->
+        make_list(T, [ {K, lists:sort(make_list(V, []))} | Acc ] );
+make_list([  H | T ], Acc) ->
+        make_list(T, [ H | Acc ]).
 
 get_main_app_name(State) ->
     case rebar_state:project_apps(State) of
