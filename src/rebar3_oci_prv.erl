@@ -31,19 +31,23 @@ init(State) ->
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
     RelDir = filename:join(rebar_dir:base_dir(State), "rel"), % TODO: some day Tristan promised this will be replaced by a real API call
+    AppName = get_main_app_name(State),
     TarDir = insecure_mkdtemp(),
-    OutName = filename:join(TarDir, random_name()),
-    RelFiles = filelib:fold_files(RelDir, ".+", true, fun(F, A) -> add_file(RelDir, F, A) end, []),
-    ok = erl_tar:create(OutName, RelFiles, [dereference]),
+    DirName = rebar_utils:to_binary(AppName),
+    OutName = rebar_utils:to_binary(filename:join(TarDir, random_name())),
+    ok = do_shell_tar(to_binary(OutName),
+                      to_binary(RelDir),
+                      to_binary(DirName),
+                      false),
     {LayerSize, LayerSHA} = sha256_from_file(OutName),
-    ConfigJson = jsone:encode(format_oci_config(LayerSHA)),
+    ConfigJson = to_json(format_oci_config(LayerSHA)),
     ConfigSHA = sha256(ConfigJson),
     ConfigSize = byte_size(ConfigJson),
-    ManifestJson = jsone:encode(format_oci_manifest(ConfigSize, ConfigSHA, LayerSize, LayerSHA)),
+    ManifestJson = to_json((format_oci_manifest(ConfigSize, ConfigSHA, LayerSize, LayerSHA))),
     ManifestSHA = sha256(ManifestJson),
     ManifestSize = byte_size(ManifestJson),
-    IndexJson = jsone:encode(format_oci_index(ManifestSize, ManifestSHA)),
-    LayoutJson = jsone:encode(format_oci_layout()),
+    IndexJson = to_json(format_oci_index(ManifestSize, ManifestSHA)),
+    LayoutJson = to_json(format_oci_layout()),
 
     WorkDir = insecure_mkdtemp(),
     ok = mkdir_p(filename:join(WorkDir, "blobs/sha256")),
@@ -52,12 +56,14 @@ do(State) ->
     write_blob(WorkDir, ManifestSHA, ManifestJson),
     write_blob(WorkDir, ConfigSHA, ConfigJson),
     file:rename(OutName, filename:join([WorkDir, "blobs/sha256", LayerSHA])),
-    ImgFiles = filelib:fold_files(WorkDir, ".+", true, fun(F, A) -> add_file(WorkDir, F, A) end, []),
 
-    Name = rebar_utils:to_list(get_main_app_name(State)) ++ ".tgz",
-    ok = erl_tar:create(Name, ImgFiles, [compressed]),
-    deltree(TarDir),
-    deltree(WorkDir),
+    Name = rebar_utils:to_list(AppName) ++ ".tgz",
+    ok = do_shell_tar(to_binary(Name),
+                      to_binary(WorkDir),
+                      <<".">>,
+                      true),
+    %deltree(TarDir),
+    %deltree(WorkDir),
     {Sz, ImageSHA} = sha256_from_file(Name),
     rebar_api:info("OCI image '~s' created (sha256: ~s, bytes: ~p)~n", [Name, rebar_utils:to_list(ImageSHA), Sz]),
     {ok, State}.
@@ -66,15 +72,34 @@ do(State) ->
 format_error(Reason) ->
     io_lib:format("~p", [Reason]).
 
+%% We build our data structures in maps but the key ordering is
+%% non-deterministic and we need determinism in serialization
+to_json(Data) when is_map(Data) ->
+    jsone:encode(lists:sort(maps:to_list(Data))).
+
+to_binary(X) when is_list(X) -> list_to_binary(X);
+to_binary(X) when is_binary(X) -> X;
+to_binary(X) -> error(bad_type, X).
+
 get_main_app_name(State) ->
     case rebar_state:project_apps(State) of
         [AppInfo] -> rebar_app_info:name(AppInfo);
         _ -> rebar_api:error(no_main_app)
     end.
 
-add_file(Dir, F, Acc) ->
-    ArchiveName = F -- (Dir ++ "/"),
-    [{ArchiveName, F}|Acc].
+do_shell_tar(OutputName, SrcDir, TopDir, Compress) ->
+    Cmd = case Compress of
+              false ->
+                  <<"tar --sort=name --owner=0 --group=0 --numeric-owner -C ",
+                    SrcDir/binary, " -cf ", OutputName/binary, " ", TopDir/binary>>;
+              true ->
+                  <<"tar --gzip --sort=name --owner=0 --group=0 --numeric-owner -C ",
+                    SrcDir/binary, " -cf ", OutputName/binary, " ", TopDir/binary>>
+          end,
+    rebar_api:debug("executing: ~p", [Cmd]),
+    O = os:cmd(rebar_utils:to_list(Cmd)),
+    rebar_api:debug("output: ~p", [O]),
+    ok.
 
 write_file(D, F, Data) ->
     ok = file:write_file(filename:join(D,F), Data).
