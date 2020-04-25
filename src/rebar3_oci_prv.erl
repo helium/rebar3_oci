@@ -9,6 +9,16 @@
 -define(CHUNK_SIZE, 4096).
 -define(VERSION, <<"1.0.0">>).
 
+-record(tar_files, {
+    others = ordsets:new(),
+    arch = ordsets:new()
+}).
+
+-record(oci_layer, {
+    hash,
+    size,
+    filename
+}).
 
 %% ===================================================================
 %% Public API
@@ -32,14 +42,37 @@ init(State) ->
 do(State) ->
     RelDir = filename:join(rebar_dir:base_dir(State), "rel"), % TODO: some day Tristan promised this will be replaced by a real API call
     TarDir = insecure_mkdtemp(),
-    OutName = filename:join(TarDir, random_name()),
-    RelFiles = filelib:fold_files(RelDir, ".+", true, fun(F, A) -> add_file(RelDir, F, A) end, []),
-    ok = erl_tar:create(OutName, lists:sort(RelFiles), [dereference, {mtime, 0}, {atime, 0}, {ctime, 0}, {uid, 0}, {gid, 0}]),
-    {LayerSize, LayerSHA} = sha256_from_file(OutName),
-    ConfigJson = to_json(format_oci_config(LayerSHA)),
+    MainName = filename:join(TarDir, random_name()),
+    #tar_files{ others = Others, arch = Arch } =
+        filelib:fold_files(RelDir, ".+", true,
+                           fun(F, A) -> add_file(RelDir, F, A) end,
+                           #tar_files{}),
+    ok = erl_tar:create(MainName, ordsets:to_list(Others),
+                        [dereference, {mtime, 0}, {atime, 0},
+                         {ctime, 0}, {uid, 0}, {gid, 0}]),
+    ArchLayer = case Arch of
+             [] -> {none, 0, none}; %% no platform specific files
+             _ ->
+                 ArchName = filename:join(TarDir, random_name()),
+                 ok = erl_tar:create(ArchName, ordsets:to_list(Arch),
+                                [{mtime, 0}, {atime, 0},
+                                 {ctime, 0}, {uid, 0},
+                                 {gid, 0}]),
+                 {Sz, SHA} = sha256_from_file(ArchName),
+                 #oci_layer{ filename = ArchName,
+                             size = Sz,
+                             hash = SHA }
+    end,
+    {LayerSize, LayerSHA} = sha256_from_file(MainName),
+    Main = #oci_layer{ filename = MainName,
+                          size = LayerSize,
+                          hash = LayerSHA },
+    Layers = [Main, ArchLayer],
+    ConfigJson = to_json(format_oci_config(Layers)),
     ConfigSHA = sha256(ConfigJson),
     ConfigSize = byte_size(ConfigJson),
-    ManifestJson = to_json(format_oci_manifest(ConfigSize, ConfigSHA, LayerSize, LayerSHA)),
+    ManifestJson = to_json(
+                     format_oci_manifest(ConfigSize, ConfigSHA, Layers)),
     ManifestSHA = sha256(ManifestJson),
     ManifestSize = byte_size(ManifestJson),
     IndexJson = to_json(format_oci_index(ManifestSize, ManifestSHA)),
@@ -51,15 +84,18 @@ do(State) ->
     write_file(WorkDir, <<"index.json">>, IndexJson),
     write_blob(WorkDir, ManifestSHA, ManifestJson),
     write_blob(WorkDir, ConfigSHA, ConfigJson),
-    file:rename(OutName, filename:join([WorkDir, "blobs/sha256", LayerSHA])),
+    file:rename(Main#oci_layer.filename,
+                filename:join([WorkDir, "blobs/sha256",
+                Main#oci_layer.hash])),
     ImgFiles = filelib:fold_files(WorkDir, ".+", true, fun(F, A) -> add_file(WorkDir, F, A) end, []),
 
     Name = rebar_utils:to_list(get_main_app_name(State)) ++ ".tgz",
     ok = erl_tar:create(Name, lists:sort(ImgFiles), [compressed, {mtime, 0}, {atime, 0}, {ctime, 0}, {uid, 0}, {gid, 0}]),
     deltree(TarDir),
     deltree(WorkDir),
-    {Sz, ImageSHA} = sha256_from_file(Name),
-    rebar_api:info("OCI image '~s' created (sha256: ~s, bytes: ~p)~n", [Name, rebar_utils:to_list(ImageSHA), Sz]),
+    {ISz, ImageSHA} = sha256_from_file(Name),
+    rebar_api:info("OCI image '~s' created (sha256: ~s, bytes: ~p)~n",
+                   [Name, rebar_utils:to_list(ImageSHA), ISz]),
     {ok, State}.
 
 -spec format_error(any()) ->  iolist().
@@ -87,7 +123,25 @@ get_main_app_name(State) ->
 
 add_file(Dir, F, Acc) ->
     ArchiveName = F -- (Dir ++ "/"),
-    [{ArchiveName, F}|Acc].
+    %% want to check to see if the parent directory
+    %% of the current file is something we especially
+    %% care about.
+    %%
+    %% Always skip "src"
+    %% Tag files in "priv" as platform dependent
+    %% And everything else, we will package
+    [_, S | _ ] = lists:reverse(filename:split(F)),
+    case S of
+        "priv" -> handle_priv({ArchiveName, F}, Acc);
+        "src" -> Acc;
+        _ -> handle_others({ArchiveName, F}, Acc)
+    end.
+
+handle_priv(E, #tar_files{ arch = A }=Acc) ->
+    Acc#tar_files{ arch = ordsets:add_element(E, A) }.
+
+handle_others(E, #tar_files{ others = A } = Acc) ->
+    Acc#tar_files{ others = ordsets:add_element(E, A) }.
 
 write_file(D, F, Data) ->
     ok = file:write_file(filename:join(D,F), Data).
@@ -190,30 +244,58 @@ format_oci_layout() ->
 %% https://github.com/opencontainers/image-spec/blob/master/config.md
 %% application/vnd.oci.image.config.v1+json
 %%
-format_oci_config(LayerSHA) ->
-    #{ <<"architecture">> => <<"amd64">>,
-       <<"os">> => <<"linux">>,
+format_oci_config(Layers) ->
+    {Arch, OS, Bits} = parse_rebar_arch(rebar_api:get_arch()),
+    M = #{ <<"architecture">> => Arch,
+       <<"os">> => OS,
        <<"rootfs">> => #{
            <<"type">> => <<"layers">>,
-           <<"diff_ids">> => [ <<"sha256:", LayerSHA/binary>> ]
+           <<"diff_ids">> => [ calc_diff_ids(Layers) ]
           }
-     }.
+     },
+    case Bits of
+        "64" -> M#{ <<"variant">> => <<"v8">> };
+        _ -> M
+    end.
 
-format_oci_manifest(ConfigSize, ConfigSHA, LayerSize, LayerSHA) ->
+calc_diff_ids(Ls) ->
+    lists:foldr(fun(L, []) -> L#oci_layer.hash;
+                   (L, Acc) ->
+                        Sha = L#oci_layer.hash,
+                        crypto:hash(sha256, <<Acc/binary, " ", Sha/binary>>)
+                end,
+                Ls).
+
+parse_rebar_arch(ArchString) ->
+    rebar_api:debug("arch: ~p", [ArchString]),
+    [_OTP, Arch, _Distro, OS, _Build, Bits] = strings:token(ArchString, "-"),
+    {translate_arch(Arch), translate_os(OS), Bits}.
+
+translate_arch("amd64") -> <<"amd64">>;
+translate_arch("arm64") -> <<"arm64">>.
+
+translate_os("linux") -> <<"linux">>;
+translate_os("darwin") -> <<"darwin">>.
+
+format_oci_manifest(ConfigSize, ConfigSHA, Layers) ->
     #{ <<"schemaVersion">> => 2,
        <<"config">> => #{
            <<"mediaType">> => <<"application/vnd.oci.image.config.v1+json">>,
            <<"size">> => ConfigSize,
            <<"digest">> => <<"sha256:", ConfigSHA/binary>>
        },
-       <<"layers">> => [
-            #{
-               <<"mediaType">> => <<"application/vnd.oci.image.layer.v1.tar">>,
-               <<"size">> => LayerSize,
-               <<"digest">> => <<"sha256:", LayerSHA/binary>>
-             }
-      ]
+       <<"layers">> => make_layers(Layers, [])
      }.
+
+make_layers([], Acc) -> lists:reverse(Acc);
+make_layers([H|T], Acc) ->
+    Sha = H#oci_layer.hash,
+    make_layers(T,
+      [#{
+         <<"mediaType">> => <<"application/vnd.oci.image.layer.v1.tar">>,
+         <<"size">> => H#oci_layer.size,
+         <<"digest">> => <<"sha256:", Sha/binary>>
+        } | Acc ]).
 
 format_oci_index(ManifestSize, ManifestSHA) ->
     #{ <<"schemaVersion">> => 2,
