@@ -47,7 +47,7 @@ do(State) ->
 
     WorkDir = insecure_mkdtemp(),
     ok = mkdir_p(filename:join(WorkDir, "blobs/sha256")),
-    write_file(WorkDir, <<"oci-layout.json">>, LayoutJson),
+    write_file(WorkDir, <<"oci-layout">>, LayoutJson),
     write_file(WorkDir, <<"index.json">>, IndexJson),
     write_blob(WorkDir, ManifestSHA, ManifestJson),
     write_blob(WorkDir, ConfigSHA, ConfigJson),
@@ -208,7 +208,10 @@ format_oci_index(ManifestSize, ManifestSHA) ->
             #{
                <<"mediaType">> => <<"application/vnd.oci.image.manifest.v1+json">>,
                <<"size">> => ManifestSize,
-               <<"digest">> => <<"sha256:", ManifestSHA/binary>>
+               <<"digest">> => <<"sha256:", ManifestSHA/binary>>,
+               <<"annotations">> => #{
+                   <<"org.opencontainers.image.ref.name">> => <<"latest">>
+                }
              }
        ],
        <<"annotations">> => #{
